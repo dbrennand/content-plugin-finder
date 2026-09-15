@@ -119,3 +119,72 @@ def test_load_returns_none_on_corrupt_json(tmp_path):
     cache_path.write_text("not valid json{{{", encoding="utf-8")
     result = load_cached_index(cache_path, "fp")
     assert result is None
+
+
+def _mini_collection_for_cache(tmp_path: Path) -> Path:
+    """Minimal collection with one module and one integration target."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "galaxy.yml").write_text(
+        "namespace: acme\nname: widgets\n", encoding="utf-8"
+    )
+    modules = tmp_path / "plugins" / "modules"
+    modules.mkdir(parents=True)
+    (modules / "thing.py").write_text(
+        'DOCUMENTATION = """\nmodule: thing\n"""\n', encoding="utf-8"
+    )
+    target = tmp_path / "tests" / "integration" / "targets" / "thing_test"
+    target.mkdir(parents=True)
+    (target / "aliases").write_text("thing\n", encoding="utf-8")
+    (target / "tasks").mkdir()
+    (target / "tasks" / "main.yml").write_text(
+        "- acme.widgets.thing:\n    name: y\n", encoding="utf-8"
+    )
+    return tmp_path
+
+
+def test_compute_impact_writes_cache(tmp_path, monkeypatch):
+    from content_plugin_finder.impact.engine import compute_impact
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    collection = _mini_collection_for_cache(tmp_path / "col")
+    compute_impact(
+        collection_root=collection,
+        changed_files=["plugins/modules/thing.py"],
+    )
+    cache_dir = tmp_path / "cache" / "content-plugin-finder"
+    assert any(cache_dir.glob("*.json")), "cache file should have been written"
+
+
+def test_compute_impact_uses_cache_on_second_call(tmp_path, monkeypatch):
+    from content_plugin_finder.impact.engine import compute_impact
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    collection = _mini_collection_for_cache(tmp_path / "col")
+    # First call builds and caches
+    report1 = compute_impact(
+        collection_root=collection,
+        changed_files=["plugins/modules/thing.py"],
+    )
+    # Second call should hit cache — corrupt the source so we know it's not re-scanned
+    (collection / "plugins" / "modules" / "thing.py").write_text(
+        "# emptied\n", encoding="utf-8"
+    )
+    report2 = compute_impact(
+        collection_root=collection,
+        changed_files=["plugins/modules/thing.py"],
+    )
+    assert report2.integration_targets == report1.integration_targets
+
+
+def test_compute_impact_no_cache_skips_read_and_write(tmp_path, monkeypatch):
+    from content_plugin_finder.impact.engine import compute_impact
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    collection = _mini_collection_for_cache(tmp_path / "col")
+    compute_impact(
+        collection_root=collection,
+        changed_files=["plugins/modules/thing.py"],
+        no_cache=True,
+    )
+    cache_dir = tmp_path / "cache" / "content-plugin-finder"
+    assert not any(cache_dir.glob("*.json")), "no_cache=True should not write cache"

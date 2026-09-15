@@ -10,6 +10,12 @@ from content_plugin_finder.collection.graph import (
     build_collection_graph,
 )
 from content_plugin_finder.discover import discover_scan_roots
+from content_plugin_finder.impact.cache import (
+    compute_fingerprint,
+    default_cache_path,
+    load_cached_index,
+    save_cached_index,
+)
 from content_plugin_finder.impact.content_index import (
     ContentIndex,
     build_content_index,
@@ -142,17 +148,39 @@ def compute_impact(
     depth: int = 4,
     graph: CollectionGraph | None = None,
     content_index: ContentIndex | None = None,
+    cache_path: Path | None = None,
+    no_cache: bool = False,
 ) -> ImpactReport:
     """Map changed files to molecule scenarios and integration targets."""
     collection_root = collection_root.resolve()
     parent = (parent or collection_root).resolve()
     graph = graph or build_collection_graph(collection_root)
-    content_index = content_index or build_content_index(
-        parent,
-        collection=graph.collection,
-        depth=depth,
-        kinds=list(PluginKind),
-    )
+    if content_index is None:
+        if no_cache:
+            content_index = build_content_index(
+                parent,
+                collection=graph.collection,
+                depth=depth,
+                kinds=list(PluginKind),
+            )
+        else:
+            _roots = discover_scan_roots(parent, depth)
+            _fp = compute_fingerprint(
+                _roots,
+                collection=graph.collection,
+                depth=depth,
+                kinds=list(PluginKind),
+            )
+            _cache_path = cache_path or default_cache_path(collection_root)
+            content_index = load_cached_index(_cache_path, _fp)
+            if content_index is None:
+                content_index = build_content_index(
+                    parent,
+                    collection=graph.collection,
+                    depth=depth,
+                    kinds=list(PluginKind),
+                )
+                save_cached_index(_cache_path, content_index, _fp)
 
     # Ensure roots map exists even if index was built separately
     if not content_index.roots:
