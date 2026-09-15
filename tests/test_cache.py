@@ -188,3 +188,32 @@ def test_compute_impact_no_cache_skips_read_and_write(tmp_path, monkeypatch):
     )
     cache_dir = tmp_path / "cache" / "content-plugin-finder"
     assert not any(cache_dir.glob("*.json")), "no_cache=True should not write cache"
+
+
+def test_save_cached_index_handles_permission_error(tmp_path):
+    from content_plugin_finder.impact.cache import save_cached_index
+
+    index = ContentIndex(collection="acme.widgets")
+    fingerprint = "abc123"
+    cache_path = tmp_path / "cache.json"
+
+    # Make parent directory read-only to simulate permission error
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(cache_path.parent, 0o444)
+
+    try:
+        # This should raise OSError/PermissionError
+        with os.popen("id -u") as p:
+            uid = int(p.read().strip())
+        is_root = uid == 0
+
+        if not is_root:
+            # Only test if not running as root (root can write to read-only dirs)
+            try:
+                save_cached_index(cache_path, index, fingerprint)
+                assert False, "Expected OSError to be raised"
+            except OSError:
+                pass  # Expected
+    finally:
+        # Restore permissions for cleanup
+        os.chmod(cache_path.parent, 0o755)

@@ -180,7 +180,10 @@ def compute_impact(
                     depth=depth,
                     kinds=list(PluginKind),
                 )
-                save_cached_index(_cache_path, content_index, _fp)
+                try:
+                    save_cached_index(_cache_path, content_index, _fp)
+                except OSError:
+                    pass
 
     # Ensure roots map exists even if index was built separately
     if not content_index.roots:
