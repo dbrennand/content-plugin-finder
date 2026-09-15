@@ -21,6 +21,23 @@ class ContentIndex:
     # absolute root path -> relpath
     roots: dict[str, str] = field(default_factory=dict)
 
+    def to_dict(self) -> dict:
+        return {
+            "collection": self.collection,
+            "plugin_to_roots": self.plugin_to_roots,
+            "root_kinds": self.root_kinds,
+            "roots": self.roots,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ContentIndex":
+        return cls(
+            collection=data["collection"],
+            plugin_to_roots=data["plugin_to_roots"],
+            root_kinds=data["root_kinds"],
+            roots=data["roots"],
+        )
+
 
 def classify_root(root: Path, parent: Path) -> str:
     """Return ``molecule`` or ``integration`` for a scan root."""
