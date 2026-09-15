@@ -1,3 +1,4 @@
+import io
 from pathlib import Path
 
 from content_plugin_finder.cli import main
@@ -66,3 +67,75 @@ def test_cli_parent_scan(tmp_path: Path, capsys):
     )
     out = capsys.readouterr().out
     assert "filter: default" in out
+
+
+def _build_mini_collection(col: Path) -> None:
+    """Create minimal collection structure for impact tests."""
+    # Create galaxy.yml
+    col.mkdir(parents=True, exist_ok=True)
+    (col / "galaxy.yml").write_text(
+        "namespace: test\nname: collection\nversion: 1.0.0\n"
+    )
+
+    # Create a simple module
+    plugins_dir = col / "plugins" / "modules"
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    (plugins_dir / "test_module.py").write_text(
+        "DOCUMENTATION = ''\n"
+        "EXAMPLES = ''\n"
+        "def main():\n"
+        "    pass\n"
+    )
+
+    # Create integration test structure
+    test_dir = col / "tests" / "integration" / "targets" / "test_target"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    (test_dir / "aliases").write_text("test_target\n")
+    tasks_dir = test_dir / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    (tasks_dir / "main.yml").write_text(
+        "- name: Test task\n"
+        "  debug:\n"
+        "    msg: test\n"
+    )
+
+
+def test_no_cache_flag_accepted(tmp_path: Path, monkeypatch):
+    """--no-cache is a valid flag and produces output."""
+    col = tmp_path / "col"
+    _build_mini_collection(col)
+    # Mock stdin with empty input
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    result = main(["--impact", str(col), "--from-stdin", "--no-cache"])
+    assert result == 0
+
+
+def test_clear_cache_flag_accepted(tmp_path: Path, monkeypatch):
+    """--clear-cache deletes the cache file and exits cleanly."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    col = tmp_path / "col"
+    _build_mini_collection(col)
+
+    # First run: populate cache
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert main(["--impact", str(col), "--from-stdin"]) == 0
+
+    cache_dir = tmp_path / "xdg" / "content-plugin-finder"
+    assert any(cache_dir.glob("*.json")), "Cache should be created after first run"
+
+    # --clear-cache: cache file removed, rebuild succeeds
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    result = main(["--impact", str(col), "--from-stdin", "--clear-cache"])
+    assert result == 0
+
+
+def test_cache_dir_override(tmp_path: Path, monkeypatch):
+    """--cache-dir places the cache in the given directory."""
+    col = tmp_path / "col"
+    custom = tmp_path / "custom_cache"
+    _build_mini_collection(col)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    assert main(["--impact", str(col), "--from-stdin", "--cache-dir", str(custom)]) == 0
+
+    assert any(custom.glob("*.json")), "Cache should be created in custom directory"

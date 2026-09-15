@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from content_plugin_finder.collection.graph import (
 from content_plugin_finder.crawl.orchestrator import Orchestrator
 from content_plugin_finder.crawl.registry import default_registry
 from content_plugin_finder.discover import discover_scan_roots
+from content_plugin_finder.impact.cache import default_cache_path
 from content_plugin_finder.impact.engine import (
     compute_impact,
     format_impact_json,
@@ -126,6 +128,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --impact, read changed file paths from stdin (one per line)",
     )
     parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="With --impact, skip reading and writing the content index cache",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="With --impact, delete the existing cache then rebuild",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        metavar="DIR",
+        help=(
+            "With --impact, directory for the content index cache "
+            "(default: $XDG_CACHE_HOME/content-plugin-finder/)"
+        ),
+    )
+    parser.add_argument(
         "--emit",
         choices=("all", "molecule", "integration"),
         default="all",
@@ -221,11 +242,25 @@ def _run_impact(args: argparse.Namespace) -> int:
             )
             return 2
 
+        # Resolve cache path (needed for --clear-cache even when --no-cache is set)
+        _cache_path: Path | None = None
+        if not args.no_cache:
+            _cache_path = (
+                args.cache_dir / f"{hashlib.sha256(str(collection).encode()).hexdigest()[:16]}.json"
+                if args.cache_dir
+                else default_cache_path(collection)
+            )
+
+        if args.clear_cache and _cache_path and _cache_path.is_file():
+            _cache_path.unlink()
+
         report = compute_impact(
             collection_root=collection,
             changed_files=changed,
             parent=parent,
             depth=args.depth,
+            cache_path=_cache_path,
+            no_cache=args.no_cache,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
