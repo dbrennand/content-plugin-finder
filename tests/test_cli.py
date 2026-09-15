@@ -123,10 +123,11 @@ def test_clear_cache_flag_accepted(tmp_path: Path, monkeypatch):
     cache_dir = tmp_path / "xdg" / "content-plugin-finder"
     assert any(cache_dir.glob("*.json")), "Cache should be created after first run"
 
-    # --clear-cache: cache file removed, rebuild succeeds
+    # --clear-cache --no-cache: cache file is deleted, rebuild is skipped
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
-    result = main(["--impact", str(col), "--from-stdin", "--clear-cache"])
+    result = main(["--impact", str(col), "--from-stdin", "--clear-cache", "--no-cache"])
     assert result == 0
+    assert not any(cache_dir.glob("*.json")), "Cache should be deleted by --clear-cache"
 
 
 def test_cache_dir_override(tmp_path: Path, monkeypatch):
