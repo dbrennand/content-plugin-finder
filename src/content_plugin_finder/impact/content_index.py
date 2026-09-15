@@ -30,7 +30,7 @@ class ContentIndex:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ContentIndex":
+    def from_dict(cls, data: dict) -> ContentIndex:
         return cls(
             collection=data["collection"],
             plugin_to_roots=data["plugin_to_roots"],
