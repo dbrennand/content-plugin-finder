@@ -179,6 +179,7 @@ def compute_impact(
                     collection=graph.collection,
                     depth=depth,
                     kinds=list(PluginKind),
+                    scan_roots=_roots,
                 )
                 try:
                     save_cached_index(_cache_path, content_index, _fp)

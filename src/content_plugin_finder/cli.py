@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -14,7 +13,7 @@ from content_plugin_finder.collection.graph import (
 from content_plugin_finder.crawl.orchestrator import Orchestrator
 from content_plugin_finder.crawl.registry import default_registry
 from content_plugin_finder.discover import discover_scan_roots
-from content_plugin_finder.impact.cache import default_cache_path
+from content_plugin_finder.impact.cache import cache_filename, default_cache_path
 from content_plugin_finder.impact.engine import (
     compute_impact,
     format_impact_json,
@@ -244,7 +243,7 @@ def _run_impact(args: argparse.Namespace) -> int:
 
         # Always resolve cache path (needed for --clear-cache even when --no-cache is set)
         _cache_path = (
-            args.cache_dir / f"{hashlib.sha256(str(collection).encode()).hexdigest()[:16]}.json"
+            args.cache_dir / cache_filename(collection)
             if args.cache_dir
             else default_cache_path(collection)
         )

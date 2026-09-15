@@ -12,11 +12,16 @@ _CACHE_SCHEMA_VERSION = 1
 _YAML_SUFFIXES = (".yml", ".yaml")
 
 
+def cache_filename(collection_root: Path) -> str:
+    """Return the cache JSON filename for a given collection root."""
+    key = hashlib.sha256(str(collection_root.resolve()).encode()).hexdigest()[:16]
+    return f"{key}.json"
+
+
 def default_cache_path(collection_root: Path) -> Path:
     """Return XDG-compliant cache path unique to this collection."""
     xdg_cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    key = hashlib.sha256(str(collection_root.resolve()).encode()).hexdigest()[:16]
-    return xdg_cache / "content-plugin-finder" / f"{key}.json"
+    return xdg_cache / "content-plugin-finder" / cache_filename(collection_root)
 
 
 def compute_fingerprint(

@@ -62,9 +62,10 @@ def build_content_index(
     collection: str,
     depth: int = 4,
     kinds: list[PluginKind] | None = None,
+    scan_roots: list[Path] | None = None,
 ) -> ContentIndex:
     parent = parent.resolve()
-    scan_roots = discover_scan_roots(parent, depth)
+    scan_roots = scan_roots if scan_roots is not None else discover_scan_roots(parent, depth)
     report = Orchestrator().scan(scan_roots, kinds=kinds or list(PluginKind))
 
     index = ContentIndex(collection=collection)
