@@ -179,3 +179,61 @@ def test_role_crawler_key_value_arguments(tmp_path: Path, action, arguments, exp
 
     assert {finding.name for finding in findings} == expected
     assert all(finding.path == str(source) for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "tagged_value", ["!unsafe literal", "!vault |\n      encrypted-placeholder"]
+)
+def test_role_crawler_tolerates_ansible_tags(tmp_path: Path, tagged_value: str):
+    source = tmp_path / "playbook.yml"
+    source.write_text(
+        f"- hosts: localhost\n  vars:\n    unrelated: {tagged_value}\n"
+        "  roles:\n    - acme.widgets.agent\n",
+        encoding="utf-8",
+    )
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+    findings = list(RoleCrawler().crawl(ctx))
+    assert [finding.name for finding in findings] == ["acme.widgets.agent"]
+    assert findings[0].path == str(source)
+
+
+def test_role_crawler_does_not_treat_vault_payload_as_role(tmp_path: Path):
+    (tmp_path / "tasks.yml").write_text(
+        "- include_role:\n    name: !vault encrypted-placeholder\n"
+        "- include_role:\n    name: !unsafe agent\n",
+        encoding="utf-8",
+    )
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+    assert [f.name for f in RoleCrawler().crawl(ctx)] == ["agent"]
+    # Tag handling must remain local to the crawler's loader.
+    with pytest.raises(yaml.constructor.ConstructorError):
+        yaml.safe_load("value: !unsafe literal")
+
+
+@pytest.mark.parametrize("filename", ["main.yml", "main.yaml", "main"])
+def test_role_crawler_reads_metadata_dependencies(tmp_path: Path, filename: str):
+    source = tmp_path / "meta" / filename
+    source.parent.mkdir()
+    source.write_text(
+        "dependencies:\n  - agent\n  - role: acme.widgets.other\n"
+        "  - role: '{{ dynamic }}'\n  - 42\n  - role: null\n"
+        "vars:\n  dependencies:\n    - not_a_dependency\n",
+        encoding="utf-8",
+    )
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+    findings = list(RoleCrawler().crawl(ctx))
+    assert {f.name for f in findings} == {"agent", "acme.widgets.other"}
+    assert {f.path for f in findings} == {str(source)}
+
+
+@pytest.mark.parametrize(
+    "relative", ["vars/main.yml", "requirements.yml", "meta/argument_specs.yml"]
+)
+def test_role_crawler_ignores_dependencies_outside_metadata(
+    tmp_path: Path, relative: str
+):
+    source = tmp_path / relative
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("dependencies:\n  - not_a_role\n", encoding="utf-8")
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+    assert list(RoleCrawler().crawl(ctx)) == []

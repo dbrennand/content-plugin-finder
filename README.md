@@ -220,6 +220,10 @@ file owned by the role selects every root that uses the role.
 
 Role crawling supports string and mapping entries under play-level `roles:`,
 plus short and `ansible.builtin` forms of `include_role` and `import_role`.
+Role dependencies declared in `meta/main.yml`, `meta/main.yaml`, or `meta/main`
+are also detected, including those in integration targets. Ansible `!unsafe`
+and `!vault` scalar tags are tolerated; vault contents are not decrypted or
+used as role names.
 Crawler output keeps the role name as written. Impact indexing prefixes short
 names with the local collection FQCN (for example, `agent` becomes
 `acme.widgets.agent`). Literal

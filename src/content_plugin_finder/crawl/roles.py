@@ -33,6 +33,33 @@ _IMPORT_ACTIONS = frozenset(
 )
 
 
+class _RoleLoader(yaml.SafeLoader):
+    """Read Ansible scalars without evaluating templates or decrypting vaults."""
+
+
+_RoleLoader.add_constructor("!unsafe", _RoleLoader.construct_scalar)
+# Encrypted values are opaque and must never become role names or import paths.
+_RoleLoader.add_constructor("!vault", lambda loader, node: None)
+
+
+def _is_role_metadata(path: Path) -> bool:
+    return path.parent.name == "meta" and path.name in {"main.yml", "main.yaml", "main"}
+
+
+def _metadata_roles(document: Any) -> set[str]:
+    if not isinstance(document, dict):
+        return set()
+    dependencies = document.get("dependencies")
+    if not isinstance(dependencies, list):
+        return set()
+    roles = set()
+    for dependency in dependencies:
+        name = _option(dependency, "role")
+        if _literal(name):
+            roles.add(name)
+    return roles
+
+
 def _option(value: Any, key: str) -> str | None:
     if isinstance(value, str):
         return value.strip() or None
@@ -131,7 +158,8 @@ class RoleCrawler(Crawler):
             sorted(
                 path.resolve()
                 for path in root.rglob("*")
-                if path.is_file() and path.suffix.lower() in _YAML_SUFFIXES
+                if path.is_file()
+                and (path.suffix.lower() in _YAML_SUFFIXES or _is_role_metadata(path))
             )
         )
         visited: set[Path] = set()
@@ -144,7 +172,9 @@ class RoleCrawler(Crawler):
                 continue
             visited.add(path)
             try:
-                documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+                documents = list(
+                    yaml.load_all(path.read_text(encoding="utf-8"), Loader=_RoleLoader)
+                )
             except (OSError, UnicodeError, yaml.YAMLError):
                 continue
 
@@ -152,6 +182,8 @@ class RoleCrawler(Crawler):
                 if document is None:
                     continue
                 roles, imports = _walk_node(document)
+                if _is_role_metadata(path):
+                    roles.update(_metadata_roles(document))
                 for name in sorted(roles):
                     key = (name, str(path))
                     if key in seen:

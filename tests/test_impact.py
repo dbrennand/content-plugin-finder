@@ -485,3 +485,52 @@ def test_role_key_value_arguments_select_molecule_and_integration(
         molecule: [f"role:acme.widgets.agent via {changed}"],
         integration: [f"role:acme.widgets.agent via {changed}"],
     }
+
+
+@pytest.mark.parametrize(
+    "tagged_value", ["!unsafe literal", "!vault encrypted-placeholder"]
+)
+def test_role_impact_preserves_references_with_ansible_tags(
+    tmp_path: Path, tagged_value: str
+):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    (root / molecule / "converge.yml").write_text(
+        "- import_playbook: ../../shared.yml\n", encoding="utf-8"
+    )
+    (root / "extensions/shared.yml").write_text(
+        f"- hosts: localhost\n  vars:\n    unrelated: {tagged_value}\n"
+        "  roles:\n    - acme.widgets.agent\n",
+        encoding="utf-8",
+    )
+    report = compute_impact(
+        collection_root=root, changed_files=["roles/agent/tasks/main.yml"], workers=1
+    )
+    assert report.affected_roles == ["acme.widgets.agent"]
+    assert report.molecule_scenarios == [molecule]
+    assert report.reasons[molecule] == [
+        "role:acme.widgets.agent via roles/agent/tasks/main.yml"
+    ]
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    ["agent", "acme.widgets.agent", "role: agent", "role: acme.widgets.agent"],
+)
+def test_role_impact_selects_integration_metadata_dependency(
+    tmp_path: Path, dependency: str
+):
+    root = _mini_collection(tmp_path)
+    integration = "tests/integration/targets/thing_test"
+    (root / integration / "tasks/role.yml").write_text("[]\n", encoding="utf-8")
+    metadata = root / integration / "meta/main.yml"
+    metadata.parent.mkdir()
+    metadata.write_text(f"dependencies:\n  - {dependency}\n", encoding="utf-8")
+    report = compute_impact(
+        collection_root=root, changed_files=["roles/agent/tasks/main.yml"], workers=1
+    )
+    assert report.affected_roles == ["acme.widgets.agent"]
+    assert report.integration_targets == [integration]
+    assert report.reasons[integration] == [
+        "role:acme.widgets.agent via roles/agent/tasks/main.yml"
+    ]
