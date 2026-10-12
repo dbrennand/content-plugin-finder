@@ -449,3 +449,39 @@ def test_mixed_plugin_and_role_changes_are_deduplicated(tmp_path: Path):
     for reasons in report.reasons.values():
         assert len(reasons) == 2
         assert len(reasons) == len(set(reasons))
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "include_role",
+        "import_role",
+        "ansible.builtin.include_role",
+        "ansible.builtin.import_role",
+    ],
+)
+def test_role_key_value_arguments_select_molecule_and_integration(
+    tmp_path: Path, action
+):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    integration = "tests/integration/targets/thing_test"
+    (root / molecule / "converge.yml").write_text(
+        f'- hosts: localhost\n  tasks:\n    - {action}: name="acme.widgets.agent" tasks_from=main\n',
+        encoding="utf-8",
+    )
+    (root / integration / "tasks" / "role.yml").write_text(
+        f"- {action}: tasks_from=main name=agent\n", encoding="utf-8"
+    )
+    changed = "roles/agent/tasks/main.yml"
+
+    report = compute_impact(collection_root=root, changed_files=[changed], workers=1)
+
+    assert report.affected_roles == ["acme.widgets.agent"]
+    assert report.affected_plugins == []
+    assert report.molecule_scenarios == [molecule]
+    assert report.integration_targets == [integration]
+    assert report.reasons == {
+        molecule: [f"role:acme.widgets.agent via {changed}"],
+        integration: [f"role:acme.widgets.agent via {changed}"],
+    }

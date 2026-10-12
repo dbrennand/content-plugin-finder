@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from collections import deque
 from collections.abc import Iterable
 from pathlib import Path
@@ -46,6 +47,23 @@ def _literal(value: str | None) -> bool:
     return bool(value) and "{{" not in value and "{%" not in value
 
 
+def _role_name(value: Any) -> str | None:
+    if not isinstance(value, str) or "=" not in value:
+        return _option(value, "name")
+    # Extract name from inline key=value arguments, preserving quoted values.
+    # Keep this separate from play roles and file imports, which accept strings.
+    try:
+        arguments = shlex.split(value)
+    except ValueError:
+        return None
+    name = None
+    for argument in arguments:
+        key, separator, candidate = argument.partition("=")
+        if key == "name" and separator:
+            name = candidate.strip() or None
+    return name
+
+
 def _walk_node(
     node: Any,
     visited: set[int] | None = None,
@@ -78,7 +96,7 @@ def _walk_node(
     for action in _ROLE_ACTIONS:
         if action not in node:
             continue
-        raw = _option(node[action], "name")
+        raw = _role_name(node[action])
         if _literal(raw):
             roles.add(raw)
 

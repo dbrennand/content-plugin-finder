@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from content_plugin_finder.crawl.context import build_context
 from content_plugin_finder.crawl.roles import RoleCrawler
@@ -145,3 +146,36 @@ def test_role_crawler_handles_recursive_yaml_aliases(tmp_path: Path):
     findings = list(RoleCrawler().crawl(ctx))
     assert {finding.name for finding in findings} == {"agent"}
     assert {finding.path for finding in findings} == {str(source)}
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "include_role",
+        "import_role",
+        "ansible.builtin.include_role",
+        "ansible.builtin.import_role",
+    ],
+)
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ("name=agent", {"agent"}),
+        ('name="acme.widgets.agent" tasks_from=install', {"acme.widgets.agent"}),
+        ("tasks_from=install name='acme.widgets.agent'", {"acme.widgets.agent"}),
+        ('name=agent tasks_from="{{ selected_tasks }}"', {"agent"}),
+        ('name="{{ selected_role }}"', set()),
+        ("tasks_from=install", set()),
+        ("name=", set()),
+        ('name="agent', set()),
+    ],
+)
+def test_role_crawler_key_value_arguments(tmp_path: Path, action, arguments, expected):
+    source = tmp_path / "tasks.yml"
+    source.write_text(yaml.safe_dump([{action: arguments}]), encoding="utf-8")
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+
+    findings = list(RoleCrawler().crawl(ctx))
+
+    assert {finding.name for finding in findings} == expected
+    assert all(finding.path == str(source) for finding in findings)
