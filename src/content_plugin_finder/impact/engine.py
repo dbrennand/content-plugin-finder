@@ -168,6 +168,7 @@ def compute_impact(
         depth=depth,
         kinds=list(PluginKind),
         workers=workers,
+        collection_root=collection_root,
     )
 
     # Ensure roots map exists even if index was built separately

@@ -237,3 +237,81 @@ def test_role_crawler_ignores_dependencies_outside_metadata(
     source.write_text("dependencies:\n  - not_a_role\n", encoding="utf-8")
     ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
     assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "include_role",
+        "import_role",
+        "ansible.builtin.include_role",
+        "ansible.builtin.import_role",
+    ],
+)
+@pytest.mark.parametrize("form", ["args", "action", "action_args"])
+def test_role_crawler_task_argument_forms(tmp_path: Path, action: str, form: str):
+    if form == "args":
+        task = {action: None, "args": {"name": "acme.widgets.agent"}}
+    elif form == "action":
+        task = {"action": f'{action} name="acme.widgets.agent"'}
+    else:
+        task = {"action": action, "args": {"name": "acme.widgets.agent"}}
+    source = tmp_path / "tasks.yml"
+    source.write_text(yaml.safe_dump([task]), encoding="utf-8")
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+    findings = list(RoleCrawler().crawl(ctx))
+    assert [finding.name for finding in findings] == ["acme.widgets.agent"]
+    assert findings[0].path == str(source)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ({"name": "explicit"}, ["explicit"]),
+        ("name=explicit", ["explicit"]),
+        ({"name": "{{ dynamic }}"}, []),
+        ({"name": None}, []),
+        ("name=", []),
+        ('name="broken', []),
+    ],
+)
+def test_role_crawler_explicit_arguments_override_task_args(
+    tmp_path, arguments, expected
+):
+    (tmp_path / "tasks.yml").write_text(
+        yaml.safe_dump([{"include_role": arguments, "args": {"name": "fallback"}}]),
+        encoding="utf-8",
+    )
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+    assert [f.name for f in RoleCrawler().crawl(ctx)] == expected
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "include_tasks",
+        "import_tasks",
+        "ansible.builtin.include_tasks",
+        "ansible.builtin.import_tasks",
+    ],
+)
+@pytest.mark.parametrize("form", ["inline", "args", "action"])
+def test_role_crawler_import_argument_forms(tmp_path: Path, action: str, form: str):
+    root = tmp_path / "scenario"
+    root.mkdir()
+    shared = tmp_path / "shared tasks.yml"
+    shared.write_text("- include_role:\n    name: agent\n", encoding="utf-8")
+    if form == "inline":
+        task = {action: 'file="../shared tasks.yml"'}
+    elif form == "args":
+        task = {action: None, "args": {"file": "../shared tasks.yml"}}
+    else:
+        task = {"action": f'{action} file="../shared tasks.yml"'}
+    (root / "tasks.yml").write_text(yaml.safe_dump([task]), encoding="utf-8")
+    ctx = build_context(root, need_acc=False, need_yaml=False, parent=tmp_path)
+    findings = list(RoleCrawler().crawl(ctx))
+    assert [f.name for f in findings] == ["agent"]
+    assert findings[0].path == str(shared)
+    # The new syntax must obey the same import boundary as direct filenames.
+    ctx = build_context(root, need_acc=False, need_yaml=False)
+    assert list(RoleCrawler().crawl(ctx)) == []

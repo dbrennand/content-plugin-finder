@@ -74,21 +74,44 @@ def _literal(value: str | None) -> bool:
     return bool(value) and "{{" not in value and "{%" not in value
 
 
-def _role_name(value: Any) -> str | None:
-    if not isinstance(value, str) or "=" not in value:
-        return _option(value, "name")
-    # Extract name from inline key=value arguments, preserving quoted values.
-    # Keep this separate from play roles and file imports, which accept strings.
+def _action_options(value: Any, positional: str) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    if "=" not in value:
+        return {positional: value.strip()}
+    # Normalize inline arguments without evaluating templates.
     try:
         arguments = shlex.split(value)
     except ValueError:
-        return None
-    name = None
+        return {positional: None}
+    options = {}
     for argument in arguments:
         key, separator, candidate = argument.partition("=")
-        if key == "name" and separator:
-            name = candidate.strip() or None
-    return name
+        if separator:
+            options[key] = candidate.strip() or None
+    return options
+
+
+def _task_references(node: dict) -> Iterable[tuple[str, str | None]]:
+    actions = [
+        (action, node[action])
+        for action in _ROLE_ACTIONS | _IMPORT_ACTIONS
+        if action in node
+    ]
+    action = node.get("action")
+    if isinstance(action, str) and action.strip():
+        name, *arguments = action.split(maxsplit=1)
+        if name in _ROLE_ACTIONS | _IMPORT_ACTIONS:
+            actions.append((name, arguments[0] if arguments else None))
+    for action, value in actions:
+        key = "name" if action in _ROLE_ACTIONS else "file"
+        # Explicit action arguments override task-level args, even when dynamic.
+        defaults = node.get("args")
+        options = dict(defaults) if isinstance(defaults, dict) else {}
+        options.update(_action_options(value, key))
+        yield action, _option(options, key)
 
 
 def _walk_node(
@@ -120,17 +143,12 @@ def _walk_node(
             if _literal(raw):
                 roles.add(raw)
 
-    for action in _ROLE_ACTIONS:
-        if action not in node:
-            continue
-        raw = _role_name(node[action])
+    for action, raw in _task_references(node):
         if _literal(raw):
-            roles.add(raw)
-
-    for action in _IMPORT_ACTIONS:
-        raw = _option(node.get(action), "file")
-        if _literal(raw):
-            imports.add(raw)
+            if action in _ROLE_ACTIONS:
+                roles.add(raw)
+            else:
+                imports.add(raw)
 
     for value in node.values():
         child_roles, child_imports = _walk_node(value, visited)

@@ -220,6 +220,9 @@ file owned by the role selects every root that uses the role.
 
 Role crawling supports string and mapping entries under play-level `roles:`,
 plus short and `ansible.builtin` forms of `include_role` and `import_role`.
+Task-level `args:` mappings, string `action:` syntax, and inline `name=...`
+role arguments are supported. Task imports accept direct filenames, `file:`
+mappings, and inline `file=...` arguments, including quoted paths.
 Role dependencies declared in `meta/main.yml`, `meta/main.yaml`, or `meta/main`
 are also detected, including those in integration targets. Ansible `!unsafe`
 and `!vault` scalar tags are tolerated; vault contents are not decrypted or
@@ -229,6 +232,16 @@ names with the local collection FQCN (for example, `agent` becomes
 `acme.widgets.agent`). Literal
 `import_playbook`, `import_tasks`, and `include_tasks` paths are followed while
 they remain below `--parent`; dynamic Jinja import paths are not evaluated.
+
+Impact indexing also follows references between local collection roles, from
+both metadata dependencies and include/import role tasks, with cycle protection.
+For example, a scenario using `acme.widgets.wrapper` is selected when
+`acme.widgets.agent` changes if `wrapper` depends on `agent`. Each reachable
+role is scanned once, conservatively including all of its YAML task files.
+These role scans and their static file imports stay inside the collection root,
+even when `--parent` narrows test discovery to a directory such as `extensions/`.
+External collection roles are not traversed. Library callers building an index
+with a narrower parent should pass `collection_root` to `build_content_index`.
 
 Direct path matches cover scenario and integration-target edits themselves, not only
 plugin→content reverse mapping. Shared files under a `molecule/` directory (outside

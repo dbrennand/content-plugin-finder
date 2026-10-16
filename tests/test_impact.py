@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from content_plugin_finder.cli import main
 from content_plugin_finder.collection.graph import build_collection_graph
@@ -534,3 +535,149 @@ def test_role_impact_selects_integration_metadata_dependency(
     assert report.reasons[integration] == [
         "role:acme.widgets.agent via roles/agent/tasks/main.yml"
     ]
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        {"ansible.builtin.include_role": None, "args": {"name": "acme.widgets.agent"}},
+        {"action": "ansible.builtin.include_role name=acme.widgets.agent"},
+    ],
+)
+def test_role_task_forms_select_both_target_types(tmp_path: Path, task):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    integration = "tests/integration/targets/thing_test"
+    (root / molecule / "converge.yml").write_text(
+        yaml.safe_dump([{"hosts": "localhost", "tasks": [task]}]), encoding="utf-8"
+    )
+    (root / integration / "tasks/role.yml").write_text(
+        yaml.safe_dump([task]), encoding="utf-8"
+    )
+    report = compute_impact(
+        collection_root=root, changed_files=["roles/agent/tasks/main.yml"], workers=1
+    )
+    assert report.molecule_scenarios == [molecule]
+    assert report.integration_targets == [integration]
+    assert report.reasons == {
+        target: ["role:acme.widgets.agent via roles/agent/tasks/main.yml"]
+        for target in (molecule, integration)
+    }
+
+
+def test_inline_file_import_selects_both_target_types(tmp_path: Path):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    integration = "tests/integration/targets/thing_test"
+    shared = root / "shared/roles.yml"
+    shared.parent.mkdir()
+    shared.write_text(
+        "- ansible.builtin.include_role:\n    name: acme.widgets.agent\n",
+        encoding="utf-8",
+    )
+    (root / molecule / "converge.yml").write_text(
+        "- hosts: localhost\n  tasks:\n"
+        "    - ansible.builtin.import_tasks: file=../../../shared/roles.yml\n",
+        encoding="utf-8",
+    )
+    (root / integration / "tasks/role.yml").write_text(
+        "- ansible.builtin.import_tasks: file=../../../../../shared/roles.yml\n",
+        encoding="utf-8",
+    )
+    report = compute_impact(
+        collection_root=root, changed_files=["roles/agent/tasks/main.yml"], workers=1
+    )
+    assert report.molecule_scenarios == [molecule]
+    assert report.integration_targets == [integration]
+    assert report.reasons == {
+        target: ["role:acme.widgets.agent via roles/agent/tasks/main.yml"]
+        for target in (molecule, integration)
+    }
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("narrow_parent", [False, True])
+@pytest.mark.parametrize("dependency", ["agent", "role: acme.widgets.agent"])
+def test_transitive_roles_select_referencing_roots(
+    tmp_path: Path, workers: int, narrow_parent: bool, dependency: str
+):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    integration = "tests/integration/targets/thing_test"
+    (root / molecule / "converge.yml").write_text(
+        "- hosts: localhost\n  roles:\n    - acme.widgets.wrapper\n", encoding="utf-8"
+    )
+    (root / integration / "tasks/role.yml").write_text(
+        "- include_role:\n    name: wrapper\n", encoding="utf-8"
+    )
+    metadata = root / "roles/wrapper/meta/main.yml"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(f"dependencies:\n  - {dependency}\n", encoding="utf-8")
+    parent = root / "extensions" if narrow_parent else root
+    report = compute_impact(
+        collection_root=root,
+        parent=parent,
+        changed_files=["roles/agent/tasks/main.yml"],
+        workers=workers,
+    )
+    selected_molecule = "molecule/thing_mock" if narrow_parent else molecule
+    assert report.molecule_scenarios == [selected_molecule]
+    assert report.integration_targets == ([] if narrow_parent else [integration])
+    assert report.affected_roles == ["acme.widgets.agent"]
+    assert report.reasons == {
+        target: ["role:acme.widgets.agent via roles/agent/tasks/main.yml"]
+        for target in report.molecule_scenarios + report.integration_targets
+    }
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_role_dependency_closure_handles_cycles_and_external_roles(tmp_path, workers):
+    root = _mini_collection(tmp_path)
+    files = {
+        "roles/agent/meta/main.yml": "dependencies:\n  - acme.widgets.middle\n  - external.vendor.shadow\n",
+        "roles/middle/tasks/main.yml": "- include_role:\n    name: leaf\n",
+        "roles/leaf/meta/main.yml": "dependencies:\n  - agent\n  - missing\n",
+        # An external FQCN must never resolve to a local role with the same name.
+        "roles/shadow/meta/main.yml": "dependencies:\n  - unrelated\n",
+    }
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    index = build_content_index(
+        root, collection="acme.widgets", kinds=[PluginKind.ROLE], workers=workers
+    )
+    expected = [
+        "extensions/molecule/thing_mock",
+        "tests/integration/targets/thing_test",
+    ]
+    for role in ("agent", "middle", "leaf", "missing"):
+        assert index.role_to_roots[f"acme.widgets.{role}"] == expected
+    assert "acme.widgets.shadow" not in index.role_to_roots
+    assert "acme.widgets.unrelated" not in index.role_to_roots
+    report = compute_impact(
+        collection_root=root,
+        content_index=index,
+        changed_files=["roles/leaf/tasks/deleted.yml"],
+        workers=workers,
+    )
+    assert report.molecule_scenarios == expected[:1]
+    assert report.integration_targets == expected[1:]
+
+
+def test_role_dependencies_do_not_follow_symlinks_outside_collection(tmp_path):
+    root = tmp_path / "collection"
+    root.mkdir()
+    _mini_collection(root)
+    outside = tmp_path / "outside"
+    (outside / "meta").mkdir(parents=True)
+    (outside / "meta/main.yml").write_text(
+        "dependencies:\n  - unrelated\n", encoding="utf-8"
+    )
+    (root / "roles/escape").symlink_to(outside, target_is_directory=True)
+    metadata = root / "roles/agent/meta/main.yml"
+    metadata.parent.mkdir()
+    metadata.write_text("dependencies:\n  - escape\n", encoding="utf-8")
+    index = build_content_index(root, collection="acme.widgets", workers=1)
+    assert "acme.widgets.escape" in index.role_to_roots
+    assert "acme.widgets.unrelated" not in index.role_to_roots
