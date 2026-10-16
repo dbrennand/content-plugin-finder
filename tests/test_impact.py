@@ -516,7 +516,14 @@ def test_role_impact_preserves_references_with_ansible_tags(
 
 @pytest.mark.parametrize(
     "dependency",
-    ["agent", "acme.widgets.agent", "role: agent", "role: acme.widgets.agent"],
+    [
+        "agent",
+        "acme.widgets.agent",
+        "role: agent",
+        "role: acme.widgets.agent",
+        "name: agent",
+        "name: acme.widgets.agent",
+    ],
 )
 def test_role_impact_selects_integration_metadata_dependency(
     tmp_path: Path, dependency: str
@@ -597,7 +604,9 @@ def test_inline_file_import_selects_both_target_types(tmp_path: Path):
 
 @pytest.mark.parametrize("workers", [1, 2])
 @pytest.mark.parametrize("narrow_parent", [False, True])
-@pytest.mark.parametrize("dependency", ["agent", "role: acme.widgets.agent"])
+@pytest.mark.parametrize(
+    "dependency", ["agent", "role: acme.widgets.agent", "name: acme.widgets.agent"]
+)
 def test_transitive_roles_select_referencing_roots(
     tmp_path: Path, workers: int, narrow_parent: bool, dependency: str
 ):
@@ -681,3 +690,21 @@ def test_role_dependencies_do_not_follow_symlinks_outside_collection(tmp_path):
     index = build_content_index(root, collection="acme.widgets", workers=1)
     assert "acme.widgets.escape" in index.role_to_roots
     assert "acme.widgets.unrelated" not in index.role_to_roots
+
+
+@pytest.mark.parametrize("name", ["agent", "acme.widgets.agent"])
+def test_play_role_name_alias_selects_scenario(tmp_path: Path, name: str):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    (root / molecule / "converge.yml").write_text(
+        yaml.safe_dump([{"hosts": "localhost", "roles": [{"name": name}]}]),
+        encoding="utf-8",
+    )
+    report = compute_impact(
+        collection_root=root, changed_files=["roles/agent/tasks/main.yml"], workers=1
+    )
+    assert report.affected_roles == ["acme.widgets.agent"]
+    assert report.molecule_scenarios == [molecule]
+    assert report.reasons[molecule] == [
+        "role:acme.widgets.agent via roles/agent/tasks/main.yml"
+    ]

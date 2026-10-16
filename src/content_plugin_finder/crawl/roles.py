@@ -54,7 +54,7 @@ def _metadata_roles(document: Any) -> set[str]:
         return set()
     roles = set()
     for dependency in dependencies:
-        name = _option(dependency, "role")
+        name = _role_reference_name(dependency)
         if _literal(name):
             roles.add(name)
     return roles
@@ -68,6 +68,13 @@ def _option(value: Any, key: str) -> str | None:
         if isinstance(candidate, str):
             return candidate.strip() or None
     return None
+
+
+def _role_reference_name(value: Any) -> str | None:
+    # Match Ansible's ds.get('role', ds.get('name')): only an absent role key
+    # allows the alias, not an empty, null, or dynamic role value.
+    key = "name" if isinstance(value, dict) and "role" not in value else "role"
+    return _option(value, key)
 
 
 def _literal(value: str | None) -> bool:
@@ -139,7 +146,7 @@ def _walk_node(
     role_list = node.get("roles")
     if "hosts" in node and isinstance(role_list, list):
         for item in role_list:
-            raw = _option(item, "role")
+            raw = _role_reference_name(item)
             if _literal(raw):
                 roles.add(raw)
 

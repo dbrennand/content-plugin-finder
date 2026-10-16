@@ -220,6 +220,8 @@ file owned by the role selects every root that uses the role.
 
 Role crawling supports string and mapping entries under play-level `roles:`,
 plus short and `ansible.builtin` forms of `include_role` and `import_role`.
+Play-level role mappings and metadata dependencies accept `name:` when the
+`role:` key is absent, matching Ansible's precedence rules.
 Task-level `args:` mappings, string `action:` syntax, and inline `name=...`
 role arguments are supported. Task imports accept direct filenames, `file:`
 mappings, and inline `file=...` arguments, including quoted paths.

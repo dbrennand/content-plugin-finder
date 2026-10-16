@@ -315,3 +315,34 @@ def test_role_crawler_import_argument_forms(tmp_path: Path, action: str, form: s
     # The new syntax must obey the same import boundary as direct filenames.
     ctx = build_context(root, need_acc=False, need_yaml=False)
     assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize("source_kind", ["play", "metadata"])
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ({"name": " agent "}, ["agent"]),
+        ({"name": "acme.widgets.agent"}, ["acme.widgets.agent"]),
+        ({"role": "explicit", "name": "fallback"}, ["explicit"]),
+        ({"role": None, "name": "fallback"}, []),
+        ({"role": "", "name": "fallback"}, []),
+        ({"role": "{{ dynamic }}", "name": "fallback"}, []),
+        ({"name": "{{ dynamic }}"}, []),
+        ({"name": 42}, []),
+    ],
+)
+def test_role_name_alias_and_precedence(tmp_path, source_kind, entry, expected):
+    if source_kind == "play":
+        source = tmp_path / "playbook.yml"
+        document = [{"hosts": "localhost", "roles": [entry]}]
+    else:
+        source = tmp_path / "meta/main.yml"
+        source.parent.mkdir()
+        document = {"dependencies": [entry]}
+    source.write_text(yaml.safe_dump(document), encoding="utf-8")
+    ctx = build_context(tmp_path, need_acc=False, need_yaml=False)
+
+    findings = list(RoleCrawler().crawl(ctx))
+
+    assert [finding.name for finding in findings] == expected
+    assert all(finding.path == str(source) for finding in findings)
