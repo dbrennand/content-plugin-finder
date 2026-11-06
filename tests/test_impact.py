@@ -708,3 +708,65 @@ def test_play_role_name_alias_selects_scenario(tmp_path: Path, name: str):
     assert report.reasons[molecule] == [
         "role:acme.widgets.agent via roles/agent/tasks/main.yml"
     ]
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_nested_shared_playbook_import_selects_scenario(tmp_path, workers):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    files = {
+        f"{molecule}/converge.yml": "- import_playbook: ../../../shared/play.yml\n",
+        "shared/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: sub/child.yml\n",
+        "shared/sub/child.yml": "- import_tasks: common.yml\n",
+        "shared/common.yml": "- import_role:\n    name: acme.widgets.agent\n",
+    }
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    report = compute_impact(
+        collection_root=root,
+        changed_files=["roles/agent/tasks/main.yml"],
+        workers=workers,
+    )
+
+    assert report.molecule_scenarios == [molecule]
+    assert report.reasons[molecule] == [
+        "role:acme.widgets.agent via roles/agent/tasks/main.yml"
+    ]
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("entry_point", ["main", "main.yml"])
+def test_extensionless_role_tasks_select_referencing_roots(
+    tmp_path, workers, entry_point
+):
+    root = _mini_collection(tmp_path)
+    molecule = "extensions/molecule/thing_mock"
+    integration = "tests/integration/targets/thing_test"
+    (root / molecule / "converge.yml").write_text(
+        "- hosts: localhost\n  roles:\n    - acme.widgets.wrapper\n", encoding="utf-8"
+    )
+    (root / integration / "tasks/role.yml").write_text(
+        "- include_role:\n    name: wrapper\n", encoding="utf-8"
+    )
+    tasks = root / "roles/wrapper/tasks"
+    tasks.mkdir(parents=True)
+    (tasks / entry_point).write_text("- import_tasks: dependency\n", encoding="utf-8")
+    (tasks / "dependency").write_text(
+        "- import_role:\n    name: acme.widgets.agent\n", encoding="utf-8"
+    )
+
+    report = compute_impact(
+        collection_root=root,
+        changed_files=["roles/agent/tasks/main.yml"],
+        workers=workers,
+    )
+
+    assert report.molecule_scenarios == [molecule]
+    assert report.integration_targets == [integration]
+    assert report.reasons == {
+        target: ["role:acme.widgets.agent via roles/agent/tasks/main.yml"]
+        for target in (molecule, integration)
+    }

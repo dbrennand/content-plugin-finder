@@ -225,6 +225,8 @@ Play-level role mappings and metadata dependencies accept `name:` when the
 Task-level `args:` mappings, string `action:` syntax, and inline `name=...`
 role arguments are supported. Task imports accept direct filenames, `file:`
 mappings, and inline `file=...` arguments, including quoted paths.
+Explicit imports can reference extensionless files or files with other suffixes.
+Extensionless `tasks/main` and `handlers/main` entry points are also scanned.
 Role dependencies declared in `meta/main.yml`, `meta/main.yaml`, or `meta/main`
 are also detected, including those in integration targets. Ansible `!unsafe`
 and `!vault` scalar tags are tolerated; vault contents are not decrypted or
@@ -234,6 +236,9 @@ names with the local collection FQCN (for example, `agent` becomes
 `acme.widgets.agent`). Literal
 `import_playbook`, `import_tasks`, and `include_tasks` paths are followed while
 they remain below `--parent`; dynamic Jinja import paths are not evaluated.
+Nested task imports search the current file's directory first, then the recorded
+include and playbook directories. Importing a new playbook resets that fallback
+context. The first existing file inside the scan boundary is used.
 
 Impact indexing also follows references between local collection roles, from
 both metadata dependencies and include/import role tasks, with cycle protection.

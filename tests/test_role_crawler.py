@@ -346,3 +346,148 @@ def test_role_name_alias_and_precedence(tmp_path, source_kind, entry, expected):
 
     assert [finding.name for finding in findings] == expected
     assert all(finding.path == str(source) for finding in findings)
+
+
+def _write_files(root: Path, files: dict[str, str]) -> None:
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "import_tasks",
+        "include_tasks",
+        "ansible.builtin.import_tasks",
+        "ansible.builtin.include_tasks",
+    ],
+)
+@pytest.mark.parametrize("nearest", [False, True])
+def test_nested_import_uses_playbook_fallback_and_nearest_match(
+    tmp_path, action, nearest
+):
+    files = {
+        "scenario/converge.yml": "- import_playbook: ../shared/play.yml\n",
+        "shared/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: sub/child.yml\n",
+        "shared/sub/child.yml": f"- {action}: common.yml\n",
+        "shared/common.yml": "- import_role:\n    name: fallback\n",
+    }
+    if nearest:
+        files["shared/sub/common.yml"] = "- import_role:\n    name: nearest\n"
+    _write_files(tmp_path, files)
+    ctx = build_context(
+        tmp_path / "scenario", need_acc=False, need_yaml=False, parent=tmp_path
+    )
+
+    findings = list(RoleCrawler().crawl(ctx))
+
+    assert [finding.name for finding in findings] == [
+        "nearest" if nearest else "fallback"
+    ]
+    expected = "shared/sub/common.yml" if nearest else "shared/common.yml"
+    assert findings[0].path == str(tmp_path / expected)
+
+
+def test_shared_import_retains_each_playbook_context_and_terminates_cycles(tmp_path):
+    _write_files(
+        tmp_path,
+        {
+            "scenario/converge.yml": "- import_playbook: ../one/play.yml\n- import_playbook: ../two/play.yml\n",
+            "one/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: ../shared/child.yml\n",
+            "two/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: ../shared/child.yml\n",
+            "shared/child.yml": "- import_tasks: roles.yml\n- import_tasks: child.yml\n",
+            "one/roles.yml": "- import_role:\n    name: one\n",
+            "two/roles.yml": "- import_role:\n    name: two\n",
+        },
+    )
+    ctx = build_context(
+        tmp_path / "scenario", need_acc=False, need_yaml=False, parent=tmp_path
+    )
+
+    findings = list(RoleCrawler().crawl(ctx))
+
+    assert sorted(finding.name for finding in findings) == ["one", "two"]
+    assert len(findings) == 2
+
+
+def test_imported_playbook_resets_fallback_directories(tmp_path):
+    _write_files(
+        tmp_path,
+        {
+            "scenario/converge.yml": "- import_playbook: ../outer/play.yml\n",
+            "outer/play.yml": "- import_playbook: ../inner/play.yml\n",
+            "inner/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: ../shared/child.yml\n",
+            "shared/child.yml": "- import_tasks: roles.yml\n",
+            "outer/roles.yml": "- import_role:\n    name: wrong_playbook\n",
+        },
+    )
+    ctx = build_context(
+        tmp_path / "scenario", need_acc=False, need_yaml=False, parent=tmp_path
+    )
+
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_import_fallback_cannot_escape_boundary(tmp_path, symlink):
+    parent = tmp_path / "content"
+    _write_files(
+        parent,
+        {
+            "scenario/converge.yml": "- import_playbook: ../shared/play.yml\n",
+            "shared/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: sub/child.yml\n",
+            "shared/sub/child.yml": "- import_tasks: roles.yml\n"
+            if symlink
+            else "- import_tasks: ../../../outside.yml\n",
+        },
+    )
+    outside = tmp_path / "outside.yml"
+    outside.write_text("- import_role:\n    name: outside\n", encoding="utf-8")
+    if symlink:
+        (parent / "shared/roles.yml").symlink_to(outside)
+    ctx = build_context(
+        parent / "scenario", need_acc=False, need_yaml=False, parent=parent
+    )
+
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize("subdir", ["tasks", "handlers"])
+def test_extensionless_role_entry_points_are_scanned(tmp_path, subdir):
+    _write_files(
+        tmp_path,
+        {
+            f"role/{subdir}/main": "- import_role:\n    name: agent\n",
+            "role/files/main": "- import_role:\n    name: unrelated\n",
+            "role/README": "- import_role:\n    name: unrelated\n",
+        },
+    )
+    ctx = build_context(tmp_path / "role", need_acc=False, need_yaml=False)
+
+    findings = list(RoleCrawler().crawl(ctx))
+
+    assert [finding.name for finding in findings] == ["agent"]
+    assert findings[0].path == str(tmp_path / f"role/{subdir}/main")
+
+
+@pytest.mark.parametrize("filename", ["tasks", "tasks.txt"])
+def test_explicit_import_does_not_require_yaml_suffix(tmp_path, filename):
+    _write_files(
+        tmp_path,
+        {
+            "scenario/converge.yml": f"- hosts: localhost\n  tasks:\n    - import_tasks: ../shared/{filename}\n",
+            f"shared/{filename}": "- import_role:\n    name: agent\n",
+        },
+    )
+    ctx = build_context(
+        tmp_path / "scenario", need_acc=False, need_yaml=False, parent=tmp_path
+    )
+
+    findings = list(RoleCrawler().crawl(ctx))
+
+    assert [finding.name for finding in findings] == ["agent"]
+    assert findings[0].path == str(tmp_path / "shared" / filename)
+    ctx = build_context(tmp_path / "scenario", need_acc=False, need_yaml=False)
+    assert list(RoleCrawler().crawl(ctx)) == []

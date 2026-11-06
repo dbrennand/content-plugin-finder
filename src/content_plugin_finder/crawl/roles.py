@@ -124,9 +124,9 @@ def _task_references(node: dict) -> Iterable[tuple[str, str | None]]:
 def _walk_node(
     node: Any,
     visited: set[int] | None = None,
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], set[tuple[str, str]]]:
     roles: set[str] = set()
-    imports: set[str] = set()
+    imports: set[tuple[str, str]] = set()
     if visited is None:
         visited = set()
     if isinstance(node, (list, dict)):
@@ -155,7 +155,7 @@ def _walk_node(
             if action in _ROLE_ACTIONS:
                 roles.add(raw)
             else:
-                imports.add(raw)
+                imports.add((action, raw))
 
     for value in node.values():
         child_roles, child_imports = _walk_node(value, visited)
@@ -172,6 +172,16 @@ def _below(path: Path, parent: Path) -> bool:
     return True
 
 
+def _resolve_import(
+    imported: str, directories: tuple[Path, ...], parent: Path
+) -> Path | None:
+    for directory in directories:
+        candidate = (directory / imported).resolve()
+        if _below(candidate, parent) and candidate.is_file():
+            return candidate
+    return None
+
+
 class RoleCrawler(Crawler):
     name = "role"
     kinds = frozenset({PluginKind.ROLE})
@@ -179,55 +189,76 @@ class RoleCrawler(Crawler):
     def crawl(self, ctx: CrawlContext) -> Iterable[Finding]:
         root = ctx.root.resolve()
         parent = (ctx.parent or root).resolve()
-        queue: deque[Path] = deque(
-            sorted(
+        queue: deque[tuple[Path, tuple[Path, ...]]] = deque(
+            (path, ())
+            for path in sorted(
                 path.resolve()
                 for path in root.rglob("*")
                 if path.is_file()
-                and (path.suffix.lower() in _YAML_SUFFIXES or _is_role_metadata(path))
+                and (
+                    path.suffix.lower() in _YAML_SUFFIXES
+                    or _is_role_metadata(path)
+                    or (
+                        path.name == "main"
+                        and path.parent.name in {"tasks", "handlers"}
+                    )
+                )
             )
         )
-        visited: set[Path] = set()
+        visited: set[tuple[Path, tuple[Path, ...]]] = set()
+        parsed: dict[Path, tuple[set[str], set[tuple[str, str]]]] = {}
         findings: list[Finding] = []
         seen: set[tuple[str, str]] = set()
 
         while queue:
-            path = queue.popleft().resolve()
-            if path in visited or not _below(path, parent):
+            path, ancestors = queue.popleft()
+            context = (path, ancestors)
+            if context in visited or not _below(path, parent):
                 continue
-            visited.add(path)
-            try:
-                documents = list(
-                    yaml.load_all(path.read_text(encoding="utf-8"), Loader=_RoleLoader)
-                )
-            except (OSError, UnicodeError, yaml.YAMLError):
-                continue
-
-            for document in documents:
-                if document is None:
-                    continue
-                roles, imports = _walk_node(document)
-                if _is_role_metadata(path):
-                    roles.update(_metadata_roles(document))
-                for name in sorted(roles):
-                    key = (name, str(path))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    findings.append(
-                        Finding(
-                            kind=PluginKind.ROLE,
-                            name=name,
-                            path=str(path),
-                            source="yaml-role-reference",
+            visited.add(context)
+            if path not in parsed:
+                try:
+                    documents = list(
+                        yaml.load_all(
+                            path.read_text(encoding="utf-8"), Loader=_RoleLoader
                         )
                     )
-                for imported in sorted(imports):
-                    imported_path = (path.parent / imported).resolve()
-                    if (
-                        imported_path.is_file()
-                        and imported_path.suffix.lower() in _YAML_SUFFIXES
-                        and _below(imported_path, parent)
-                    ):
-                        queue.append(imported_path)
+                except (OSError, UnicodeError, yaml.YAMLError):
+                    parsed[path] = (set(), set())
+                    continue
+                roles: set[str] = set()
+                imports: set[tuple[str, str]] = set()
+                for document in documents:
+                    child_roles, child_imports = _walk_node(document)
+                    roles.update(child_roles)
+                    imports.update(child_imports)
+                    if _is_role_metadata(path):
+                        roles.update(_metadata_roles(document))
+                parsed[path] = (roles, imports)
+
+            roles, imports = parsed[path]
+            for name in sorted(roles):
+                key = (name, str(path))
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    Finding(
+                        kind=PluginKind.ROLE,
+                        name=name,
+                        path=str(path),
+                        source="yaml-role-reference",
+                    )
+                )
+            # Keep actual include directories, rather than searching arbitrary
+            # filesystem parents. Ordered deduplication also bounds cyclic imports.
+            directories = tuple(dict.fromkeys((path.parent, *ancestors)))
+            for action, imported in sorted(imports):
+                imported_path = _resolve_import(imported, directories, parent)
+                if imported_path is not None:
+                    # A new playbook establishes its own base directory.
+                    fallbacks = (
+                        () if action.endswith("import_playbook") else directories
+                    )
+                    queue.append((imported_path, fallbacks))
         return findings
