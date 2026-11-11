@@ -770,3 +770,176 @@ def test_extensionless_role_tasks_select_referencing_roots(
         target: ["role:acme.widgets.agent via roles/agent/tasks/main.yml"]
         for target in (molecule, integration)
     }
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("narrow_parent", [False, True])
+@pytest.mark.parametrize(
+    "form", ["vars_files", "include_vars", "builtin_file", "dir", "builtin_dir"]
+)
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "roles/agent/defaults/main.yml",
+        "roles/agent/templates/unit.j2",
+        "roles/agent/defaults/deleted.yml",
+    ],
+)
+def test_variable_import_selects_consumer_for_whole_role(
+    tmp_path, workers, narrow_parent, form, changed
+):
+    root = _mini_collection(tmp_path)
+    relative = "../../../roles/agent/defaults/main.yml"
+    play = {"hosts": "localhost"}
+    if form == "vars_files":
+        play["vars_files"] = [relative]
+    else:
+        action = (
+            "ansible.builtin.include_vars"
+            if form.startswith("builtin")
+            else "include_vars"
+        )
+        value = (
+            {"dir": "../../../roles/agent/defaults"}
+            if "dir" in form
+            else {"file": relative}
+        )
+        play["tasks"] = [{action: value}]
+    scenario = root / "extensions/molecule/thing_mock/converge.yml"
+    scenario.write_text(yaml.safe_dump([play]))
+    defaults = root / "roles/agent/defaults/main.yml"
+    defaults.parent.mkdir()
+    defaults.write_text("enabled: true\n")
+    parent = root / "extensions" if narrow_parent else root
+    index = build_content_index(
+        parent,
+        collection="acme.widgets",
+        collection_root=root,
+        kinds=[PluginKind.ROLE],
+        workers=workers,
+    )
+    selected = (
+        "molecule/thing_mock" if narrow_parent else "extensions/molecule/thing_mock"
+    )
+    assert selected in index.role_to_roots["acme.widgets.agent"]
+    report = compute_impact(
+        collection_root=root,
+        parent=parent,
+        content_index=index,
+        changed_files=[changed],
+        workers=workers,
+    )
+    assert report.affected_roles == ["acme.widgets.agent"]
+    assert report.molecule_scenarios == [selected]
+    unrelated = compute_impact(
+        collection_root=root,
+        parent=parent,
+        content_index=index,
+        changed_files=["roles/unrelated/tasks/main.yml"],
+        workers=workers,
+    )
+    assert unrelated.molecule_scenarios == []
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+@pytest.mark.parametrize("workers", [1, 2])
+def test_variable_imports_propagate_transitively_with_cycles(tmp_path, kind, workers):
+    root = _mini_collection(tmp_path)
+    (root / "extensions/molecule/thing_mock/converge.yml").write_text(
+        "- hosts: localhost\n  roles: [wrapper]\n"
+    )
+    files = {
+        "roles/wrapper/tasks/main.yml": yaml.safe_dump(
+            [
+                {
+                    "include_vars": {
+                        kind: "../../agent/defaults"
+                        + ("/main.yml" if kind == "file" else "")
+                    }
+                }
+            ]
+        ),
+        "roles/wrapper/vars/local.yml": "value: true\n",
+        "roles/agent/defaults/main.yml": "hosts: localhost\nroles: [bogus]\n",
+        "roles/agent/tasks/main.yml": "- include_vars:\n    file: ../../wrapper/vars/local.yml\n",
+    }
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    index = build_content_index(
+        root, collection="acme.widgets", kinds=[PluginKind.ROLE], workers=workers
+    )
+    assert "extensions/molecule/thing_mock" in index.role_to_roots["acme.widgets.agent"]
+    assert "acme.widgets.bogus" not in index.role_to_roots
+    report = compute_impact(
+        collection_root=root,
+        content_index=index,
+        changed_files=["roles/agent/templates/unit.j2"],
+        workers=workers,
+    )
+    assert report.molecule_scenarios == ["extensions/molecule/thing_mock"]
+
+
+@pytest.mark.parametrize(
+    "case", ["filtered_dir", "search_fallback", "freeform", "payload"]
+)
+@pytest.mark.parametrize("workers", [1, 2])
+def test_reviewed_variable_import_cases_select_whole_role(tmp_path, case, workers):
+    root = _mini_collection(tmp_path)
+    scenario = root / "extensions/molecule/thing_mock"
+    relative = "../../../roles/agent/defaults/main.yml"
+    play = {"hosts": "localhost"}
+    files = {"roles/agent/defaults/main.yml": "enabled: true\n"}
+    if case == "filtered_dir":
+        play.update(
+            roles=["agent"],
+            tasks=[
+                {
+                    "include_vars": {
+                        "dir": ".",
+                        "files_matching": "^settings[.]yml$",
+                    }
+                }
+            ],
+        )
+        files["extensions/molecule/thing_mock/settings.yml"] = "enabled: true\n"
+    elif case == "search_fallback":
+        play["roles"] = ["wrapper"]
+        files["roles/wrapper/tasks/main.yml"] = (
+            "- include_vars: ../../../roles/agent/defaults/main.yml\n"
+        )
+    elif case == "freeform":
+        play["tasks"] = [{"include_vars": f"{relative} name=loaded"}]
+    else:
+        play.update(roles=["agent"], vars_files=["a_data.yml"])
+        files.update(
+            {
+                "extensions/molecule/thing_mock/a_data.yml": "some_variable:\n  - import_tasks: ../../../shared/fake_tasks.yml\n",
+                "shared/fake_tasks.yml": "- include_vars: ../extensions/molecule/thing_mock/converge.yml\n",
+            }
+        )
+    (scenario / "converge.yml").write_text(yaml.safe_dump([play]))
+    for relative_path, content in files.items():
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    index = build_content_index(
+        root, collection="acme.widgets", kinds=[PluginKind.ROLE], workers=workers
+    )
+    for changed in ("roles/agent/defaults/main.yml", "roles/agent/templates/unit.j2"):
+        report = compute_impact(
+            collection_root=root,
+            content_index=index,
+            changed_files=[changed],
+            workers=workers,
+        )
+        assert report.affected_roles == ["acme.widgets.agent"]
+        assert report.molecule_scenarios == ["extensions/molecule/thing_mock"]
+    unrelated = compute_impact(
+        collection_root=root,
+        content_index=index,
+        changed_files=["roles/unrelated/tasks/main.yml"],
+        workers=workers,
+    )
+    assert unrelated.molecule_scenarios == []

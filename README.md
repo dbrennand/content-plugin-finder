@@ -110,7 +110,7 @@ parent directory.
 | `module` | module | ansible-content-capture task/module trees             |
 | `filter` | filter | Jinja pipes in YAML scalars                           |
 | `lookup` | lookup | ACC lookup/query tasks + Jinja `lookup()` / `query()` |
-| `role`   | role   | Play roles and include/import role actions in YAML    |
+| `role`   | role   | Role declarations, metadata dependencies, and local role variable imports |
 
 Modules and action plugins are reported together as modules (not distinguishable from content alone).
 
@@ -240,8 +240,78 @@ Nested task imports search the current file's directory first, then the recorded
 include and playbook directories. Importing a new playbook resets that fallback
 context. The first existing file inside the scan boundary is used.
 
+Variable imports also establish a **whole-role dependency** when their resolved
+path belongs to a local collection's `roles/<role>/` directory. This covers
+play-level `vars_files` and short or `ansible.builtin.include_vars` tasks with
+free-form filenames, `file:` or `dir:` mappings, task `args:`, string `action:`,
+and inline arguments. The inferred role FQCN comes from `galaxy.yml`; its finding
+points to the consuming YAML file and uses source `yaml-variable-role-reference`.
+For example:
+
+```yaml
+- hosts: localhost
+  vars_files:
+    - ../../../roles/agent/defaults/main.yml
+```
+
+This consumer is selected for **any** change under `roles/agent/`, including a
+template change, even when it never invokes that role. No collection-specific
+scenario mapping is needed. Imported variable payloads are not followed as task
+imports or interpreted as role declarations. Role `vars/` and `defaults/` data
+are also excluded from executable role scans. Executable traversal follows play
+and task sequences and their task containers; arbitrary variable and module
+argument mappings cannot introduce role or task-import references.
+
+Variable resolution follows Ansible's separate search contexts:
+
+- `vars_files` uses the containing playbook's directory, checking its `vars/`
+  subdirectory before a direct relative path. An outer list imports each entry;
+  a nested list tries alternatives in order and selects the first existing file.
+- `include_vars: file` searches the current role (when applicable), the task's
+  source directory, and the playbook base directory. Each context checks `vars/`
+  before a direct path, without duplicating an explicit `vars/` prefix. Nested
+  task imports retain their role and playbook context; importing a playbook
+  establishes a new base. Intermediate task-include directories are not extra
+  variable-file search contexts.
+- `include_vars: dir` resolves relative to the current role's `vars/` directory
+  (or role root for an explicit `vars/` prefix). Outside a role, it resolves
+  relative to the task's source directory. Directory imports depend on the
+  owning role without interpreting payloads or narrowing the dependency by
+  `depth`, `extensions`, `files_matching`, or `ignore_files`.
+  Literal filters are used separately to identify variable payload files, so a
+  filtered `dir: .` import does not suppress playbooks or task files it excludes.
+  Directory traversal bounds symlinks to the collection and protects against cycles.
+
+These rules are based on Ansible's
+[variable manager](https://github.com/ansible/ansible/blob/stable-2.19/lib/ansible/vars/manager.py),
+[file search](https://github.com/ansible/ansible/blob/devel/lib/ansible/parsing/dataloader.py),
+and [include_vars action](https://github.com/ansible/ansible/blob/stable-2.19/lib/ansible/plugins/action/include_vars.py).
+Variable paths may reach sibling roles outside a narrow `--parent`, but must
+remain inside the containing collection. Canonical path checks reject symlink
+escapes; nested collections are not attributed to an outer collection's role.
+An existing non-role variable file stops lookup without creating a role edge.
+Missing ordinary search candidates are skipped, including generated candidates
+outside the collection; existing external candidates and symlink escapes stop
+lookup without creating a local role dependency.
+If all literal candidates are missing, a conservative deleted-import edge is
+retained only when their possible local owners identify one existing role.
+Ambiguous owners and entirely deleted role directories cannot be inferred.
+
+Analysis stays static: Jinja expressions/comments, home-directory expansion,
+lookups, runtime path construction, and loop-item substitution are unsupported.
+A dynamic or invalid alternative stops analysis of that candidate group unless
+an earlier literal file was already selected; independent outer-list entries
+are still analyzed. Caller-dependent role search paths that cannot be recovered
+from static task imports are not reconstructed. No Ansible execution, variable
+merge, vault decryption, or template evaluation is performed.
+Dynamic directory filters do not classify payload files or exclude their
+containing directory; a literal role-owned directory still establishes the
+whole-role dependency. Contradictory cycles in which sources classify one
+another as variable data are treated conservatively as data.
+
 Impact indexing also follows references between local collection roles, from
-both metadata dependencies and include/import role tasks, with cycle protection.
+metadata dependencies, include/import role tasks, and variable imports, with
+cycle protection.
 For example, a scenario using `acme.widgets.wrapper` is selected when
 `acme.widgets.agent` changes if `wrapper` depends on `agent`. Each reachable
 role is scanned once, conservatively including all of its YAML task files.

@@ -4,7 +4,11 @@ import pytest
 import yaml
 
 from content_plugin_finder.crawl.context import build_context
-from content_plugin_finder.crawl.roles import RoleCrawler
+from content_plugin_finder.crawl.roles import (
+    RoleCrawler,
+    _directory_files,
+    _DirectoryOptions,
+)
 from content_plugin_finder.models import PluginKind
 
 
@@ -133,12 +137,13 @@ def test_role_crawler_handles_recursive_yaml_aliases(tmp_path: Path):
     root.mkdir(parents=True)
     source = root / "converge.yml"
     source.write_text(
-        "recursive: &recursive\n"
-        "  child: *recursive\n"
-        "playbook:\n"
-        "  - hosts: localhost\n"
-        "    roles:\n"
-        "      - agent\n",
+        "- hosts: localhost\n"
+        "  vars:\n"
+        "    recursive: &recursive\n"
+        "      child: *recursive\n"
+        "  roles: [agent]\n"
+        "  tasks: &tasks\n"
+        "    - block: *tasks\n",
         encoding="utf-8",
     )
 
@@ -491,3 +496,596 @@ def test_explicit_import_does_not_require_yaml_suffix(tmp_path, filename):
     assert findings[0].path == str(tmp_path / "shared" / filename)
     ctx = build_context(tmp_path / "scenario", need_acc=False, need_yaml=False)
     assert list(RoleCrawler().crawl(ctx)) == []
+
+
+def _variable_collection(tmp_path: Path, document, files=None):
+    _write_files(
+        tmp_path,
+        {
+            "galaxy.yml": "namespace: acme\nname: widgets\n",
+            "scenario/play.yml": yaml.safe_dump(document),
+            "roles/agent/defaults/main.yml": "enabled: true\n",
+            "roles/other/vars/main.yml": "other: true\n",
+            **(files or {}),
+        },
+    )
+    return build_context(
+        tmp_path / "scenario", need_acc=False, need_yaml=False, parent=tmp_path
+    )
+
+
+@pytest.mark.parametrize("action", ["include_vars", "ansible.builtin.include_vars"])
+@pytest.mark.parametrize("form", ["free", "mapping", "inline", "args", "action", "raw"])
+def test_include_vars_file_argument_forms(tmp_path, action, form):
+    relative = "../roles/agent/defaults/main.yml"
+    task = {
+        "free": {action: relative},
+        "mapping": {action: {"file": relative}},
+        "inline": {action: f"file='{relative}' name=loaded"},
+        "args": {action: None, "args": {"file": relative}},
+        "action": {"action": f"{action} {relative}"},
+        "raw": {action: {"_raw_params": relative}},
+    }[form]
+    ctx = _variable_collection(tmp_path, [{"hosts": "localhost", "tasks": [task]}])
+    findings = list(RoleCrawler().crawl(ctx))
+    assert [(f.name, f.path, f.source) for f in findings] == [
+        (
+            "acme.widgets.agent",
+            str(tmp_path / "scenario/play.yml"),
+            "yaml-variable-role-reference",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        ("../roles/agent/defaults/main.yml", {"agent"}),
+        (
+            ["../roles/agent/defaults/main.yml", "../roles/other/vars/main.yml"],
+            {"agent", "other"},
+        ),
+        (
+            [["../roles/agent/defaults/main.yml", "../roles/other/vars/main.yml"]],
+            {"agent"},
+        ),
+        ([["missing.yml", "../roles/agent/defaults/main.yml"]], {"agent"}),
+        ([["local.yml", "../roles/agent/defaults/main.yml"]], set()),
+        ([["{{ unknown }}", "../roles/agent/defaults/main.yml"]], set()),
+        ([["../roles/agent/defaults/main.yml", "{{ unknown }}"]], {"agent"}),
+        (["{{ unknown }}", "../roles/agent/defaults/main.yml"], {"agent"}),
+        ([[42, "../roles/agent/defaults/main.yml"]], set()),
+        ([[]], set()),
+    ],
+)
+def test_vars_files_candidate_lists(tmp_path, entries, expected):
+    ctx = _variable_collection(
+        tmp_path,
+        [{"hosts": "localhost", "vars_files": entries}],
+        {"scenario/local.yml": "local: true\n"},
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {
+        f"acme.widgets.{name}" for name in expected
+    }
+
+
+@pytest.mark.parametrize("kind", ["vars_files", "file", "dir"])
+def test_variable_paths_cannot_escape_collection(tmp_path, kind):
+    outside = tmp_path / "outside/roles/escape/vars"
+    outside.mkdir(parents=True)
+    (outside / "main.yml").write_text("value: true\n")
+    collection = tmp_path / "collection"
+    raw = "../../outside/roles/escape/vars"
+    if kind != "dir":
+        raw += "/main.yml"
+    document = (
+        [{"hosts": "localhost", "vars_files": [raw]}]
+        if kind == "vars_files"
+        else [{"include_vars": {kind: raw}}]
+    )
+    ctx = _variable_collection(collection, document)
+    assert list(RoleCrawler().crawl(ctx)) == []
+    # A symlink into another collection must not be attributed to local agent.
+    link = collection / "roles/agent/defaults/linked"
+    link.symlink_to(outside, target_is_directory=True)
+    raw = "../roles/agent/defaults/linked" + ("/main.yml" if kind != "dir" else "")
+    document = (
+        [{"hosts": "localhost", "vars_files": [raw]}]
+        if kind == "vars_files"
+        else [{"include_vars": {kind: raw}}]
+    )
+    (collection / "scenario/play.yml").write_text(yaml.safe_dump(document))
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "{{ role_path }}/vars/main.yml",
+        "../roles/{{ role }}/vars/main.yml",
+        "{% if x %}a{% endif %}",
+        "{# comment #}../roles/agent/defaults/main.yml",
+        "~/roles/agent/defaults/main.yml",
+    ],
+)
+@pytest.mark.parametrize("kind", ["vars_files", "file", "dir"])
+def test_dynamic_variable_paths_are_not_evaluated(tmp_path, raw, kind):
+    document = (
+        [{"hosts": "localhost", "vars_files": [raw]}]
+        if kind == "vars_files"
+        else [{"include_vars": {kind: raw}}]
+    )
+    ctx = _variable_collection(tmp_path, document)
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize("raw", ["../../agent/defaults", "vars/../../agent/defaults"])
+def test_role_include_vars_directory_context(tmp_path, raw):
+    ctx = _variable_collection(
+        tmp_path,
+        [],
+        {
+            "roles/wrapper/tasks/nested/main.yml": yaml.safe_dump(
+                [{"include_vars": {"dir": raw}}]
+            ),
+        },
+    )
+    ctx.root = tmp_path / "roles/wrapper"
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+def test_include_vars_directory_outside_role_uses_task_source_not_playbook(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [{"import_playbook": "../shared/play.yml"}],
+        {
+            "shared/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: nested/tasks.yml\n",
+            "shared/nested/tasks.yml": "- include_vars:\n    dir: ../../roles/agent/defaults\n",
+        },
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+@pytest.mark.parametrize("role_file", ["main.yml", "vars/main.yml"])
+def test_include_vars_searches_role_before_task_directory(tmp_path, role_file):
+    ctx = _variable_collection(
+        tmp_path,
+        [],
+        {
+            "roles/wrapper/tasks/main.yml": yaml.safe_dump(
+                [{"include_vars": "main.yml"}]
+            ),
+        },
+    )
+    (tmp_path / "roles/wrapper" / role_file).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "roles/wrapper" / role_file).symlink_to(
+        tmp_path / "roles/agent/defaults/main.yml"
+    )
+    ctx.root = tmp_path / "roles/wrapper"
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+def test_include_vars_file_uses_task_then_playbook_without_include_ancestor(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [{"hosts": "localhost", "tasks": [{"import_tasks": "../shared/outer.yml"}]}],
+        {
+            "shared/outer.yml": "- import_tasks: nested/child.yml\n",
+            "shared/nested/child.yml": "- include_vars: values.yml\n",
+            "shared/values.yml": "wrong: true\n",
+        },
+    )
+    (tmp_path / "scenario/vars").mkdir()
+    (tmp_path / "scenario/vars/values.yml").symlink_to(
+        tmp_path / "roles/agent/defaults/main.yml"
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+@pytest.mark.parametrize("kind", ["vars_files", "file", "dir"])
+def test_variable_payloads_are_never_executable_even_when_initially_scanned(
+    tmp_path, kind
+):
+    raw = "data" if kind == "dir" else "data/values.yml"
+    document = (
+        [{"hosts": "localhost", "vars_files": [raw]}]
+        if kind == "vars_files"
+        else [{"include_vars": {kind: raw}}]
+    )
+    ctx = _variable_collection(
+        tmp_path,
+        document,
+        {
+            # Sorted before play.yml: discovery must discard any findings/imports
+            # obtained from the variable payload, regardless of queue ordering.
+            "scenario/data/values.yml": "hosts: localhost\nroles: [bogus]\nimport_tasks: ../../shared/bogus.yml\n",
+            "shared/bogus.yml": "- include_role: indirect_bogus\n",
+            "roles/agent/defaults/misleading.yml": "hosts: localhost\nroles: [also_bogus]\n",
+        },
+    )
+    assert list(RoleCrawler().crawl(ctx)) == []
+    ctx.root = tmp_path / "roles/agent"
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+def test_inline_variable_mappings_are_not_executable(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [
+            {
+                "hosts": "localhost",
+                "vars": {
+                    "hosts": "localhost",
+                    "roles": ["bogus"],
+                    "include_vars": "../roles/agent/defaults/main.yml",
+                },
+            }
+        ],
+    )
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+def test_vars_search_precedence_and_explicit_vars_prefix(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [{"hosts": "localhost", "vars_files": ["values.yml"]}],
+        {
+            "scenario/values.yml": "local: true\n",
+        },
+    )
+    (tmp_path / "scenario/vars").mkdir()
+    (tmp_path / "scenario/vars/values.yml").symlink_to(
+        tmp_path / "roles/agent/defaults/main.yml"
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+    (tmp_path / "scenario/play.yml").write_text(
+        "- hosts: localhost\n  vars_files: vars/values.yml\n"
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+def test_nested_collection_is_not_owned_by_outer_role(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [{"include_vars": "../roles/agent/vendor/vars.yml"}],
+        {
+            "roles/agent/vendor/galaxy.yml": "namespace: other\nname: collection\n",
+            "roles/agent/vendor/vars.yml": "value: true\n",
+        },
+    )
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize("kind", ["vars_files", "file", "dir"])
+def test_deleted_variable_import_retains_unique_role_owner(tmp_path, kind):
+    raw = "../roles/agent/defaults" + ("/main.yml" if kind != "dir" else "")
+    document = (
+        [{"hosts": "localhost", "vars_files": [raw]}]
+        if kind == "vars_files"
+        else [{"include_vars": {kind: raw}}]
+    )
+    ctx = _variable_collection(tmp_path, document)
+    (tmp_path / "roles/agent/defaults/main.yml").unlink()
+    if kind == "dir":
+        (tmp_path / "roles/agent/defaults").rmdir()
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+def test_missing_alternatives_do_not_guess_between_roles(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [
+            {
+                "hosts": "localhost",
+                "vars_files": [
+                    [
+                        "../roles/agent/defaults/deleted.yml",
+                        "../roles/other/vars/deleted.yml",
+                    ]
+                ],
+            }
+        ],
+    )
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+def test_existing_alternative_wins_over_deleted_role_file(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [
+            {
+                "hosts": "localhost",
+                "vars_files": [
+                    [
+                        "../roles/agent/defaults/deleted.yml",
+                        "../roles/other/vars/main.yml",
+                    ]
+                ],
+            }
+        ],
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.other"}
+
+
+def test_role_context_survives_task_import_outside_role(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [],
+        {
+            "roles/wrapper/tasks/main.yml": "- import_tasks: ../../../shared/tasks.yml\n",
+            "shared/tasks.yml": "- include_vars: ../../agent/defaults/main.yml\n",
+            "roles/wrapper/vars/placeholder.yml": "value: true\n",
+        },
+    )
+    ctx.root = tmp_path / "roles/wrapper"
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+def test_imported_playbook_resets_variable_search_base(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [{"import_playbook": "../shared/play.yml"}],
+        {
+            "shared/play.yml": "- hosts: localhost\n  tasks:\n    - import_tasks: nested/tasks.yml\n",
+            "shared/nested/tasks.yml": "- include_vars: values.yml\n",
+            "scenario/values.yml": "wrong: true\n",
+        },
+    )
+    (tmp_path / "shared/vars").mkdir()
+    (tmp_path / "shared/vars/values.yml").symlink_to(
+        tmp_path / "roles/agent/defaults/main.yml"
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+@pytest.mark.parametrize("filename", ["values", "values.json"])
+def test_variable_file_imports_do_not_require_yaml_suffix(tmp_path, filename):
+    ctx = _variable_collection(
+        tmp_path,
+        [{"include_vars": f"../roles/agent/defaults/{filename}"}],
+        {
+            f"roles/agent/defaults/{filename}": '{"enabled": true}\n',
+        },
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+def test_explicit_dynamic_include_vars_file_overrides_literal_args(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [
+            {
+                "include_vars": {"file": "{{ unknown }}"},
+                "args": {"file": "../roles/agent/defaults/main.yml"},
+            }
+        ],
+    )
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    ["[]", "namespace: acme", "not: [valid", "namespace: !vault secret\nname: widgets"],
+)
+def test_unusable_collection_metadata_does_not_infer_role(tmp_path, metadata):
+    ctx = _variable_collection(
+        tmp_path, [{"include_vars": "../roles/agent/defaults/main.yml"}]
+    )
+    (tmp_path / "galaxy.yml").write_text(metadata)
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+def test_filtered_directory_import_preserves_executable_sources(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [
+            {
+                "hosts": "localhost",
+                "roles": ["agent"],
+                "tasks": [
+                    {"include_vars": {"dir": ".", "files_matching": "^settings[.]yml$"}}
+                ],
+            }
+        ],
+        {"scenario/settings.yml": "enabled: true\n"},
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"agent"}
+
+
+@pytest.mark.parametrize("action", ["include_vars", "ansible.builtin.include_vars"])
+def test_missing_external_search_candidate_does_not_hide_local_import(tmp_path, action):
+    ctx = _variable_collection(
+        tmp_path,
+        [],
+        {
+            "roles/wrapper/tasks/main.yml": yaml.safe_dump(
+                [{action: "../../../roles/agent/defaults/main.yml"}]
+            ),
+        },
+    )
+    ctx.root = tmp_path / "roles/wrapper"
+    assert not (ctx.root / "vars").exists()
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+@pytest.mark.parametrize("action", ["include_vars", "ansible.builtin.include_vars"])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "../roles/agent/defaults/main.yml name=loaded",
+        "name=loaded ../roles/agent/defaults/main.yml",
+        "'../roles/agent/defaults/main.yml' name=loaded",
+    ],
+)
+def test_include_vars_combines_freeform_and_named_options(tmp_path, action, arguments):
+    ctx = _variable_collection(tmp_path, [{action: arguments}])
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"acme.widgets.agent"}
+
+
+@pytest.mark.parametrize(
+    "data_name,play_name",
+    [
+        ("a_data.yml", "z_play.yml"),
+        ("z_data.yml", "a_play.yml"),
+    ],
+)
+def test_variable_payload_cannot_poison_executable_source_exclusions(
+    tmp_path, data_name, play_name
+):
+    ctx = _variable_collection(tmp_path, [])
+    _write_files(
+        tmp_path,
+        {
+            f"scenario/{data_name}": "some_variable:\n  - import_tasks: ../shared/fake_tasks.yml\n",
+            f"scenario/{play_name}": yaml.safe_dump(
+                [
+                    {
+                        "hosts": "localhost",
+                        "vars_files": [data_name],
+                        "roles": ["agent"],
+                    }
+                ]
+            ),
+            "shared/fake_tasks.yml": yaml.safe_dump(
+                [{"include_vars": f"../scenario/{play_name}"}]
+            ),
+        },
+    )
+    findings = list(RoleCrawler().crawl(ctx))
+    assert [(f.name, f.path) for f in findings] == [
+        ("agent", str(tmp_path / f"scenario/{play_name}"))
+    ]
+
+
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        (_DirectoryOptions(depth=1), {"settings.yml", "ignored.yaml", "settings.json"}),
+        (_DirectoryOptions(extensions=("json",)), {"settings.json"}),
+        (
+            _DirectoryOptions(files_matching="^settings"),
+            {"settings.yml", "settings.json", "sub/settings.yml"},
+        ),
+        (
+            _DirectoryOptions(ignore_files=("ignored[.]yaml",)),
+            {"settings.yml", "settings.json", "sub/settings.yml"},
+        ),
+        (None, set()),
+    ],
+)
+def test_directory_payload_classification_honors_literal_filters(
+    tmp_path, options, expected
+):
+    _write_files(
+        tmp_path,
+        {
+            "settings.yml": "enabled: true\n",
+            "ignored.yaml": "ignored: true\n",
+            "settings.json": '{"enabled": true}',
+            "notes.txt": "notes\n",
+            "sub/settings.yml": "nested: true\n",
+        },
+    )
+    actual = _directory_files(tmp_path, options, tmp_path)
+    assert {str(path.relative_to(tmp_path)) for path in actual} == expected
+
+
+def test_directory_payload_classification_bounds_symlinks_and_cycles(tmp_path):
+    collection = tmp_path / "collection"
+    _write_files(collection, {"data/settings.yml": "enabled: true\n"})
+    _write_files(tmp_path, {"outside/escaped.yml": "outside: true\n"})
+    (collection / "data/escape").symlink_to(
+        tmp_path / "outside", target_is_directory=True
+    )
+    (collection / "data/cycle").symlink_to(
+        collection / "data", target_is_directory=True
+    )
+    assert _directory_files(collection / "data", _DirectoryOptions(), collection) == {
+        collection / "data/settings.yml"
+    }
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"files_matching": "{{ selected_pattern }}"},
+        {"depth": "{{ selected_depth }}"},
+        {"extensions": "{{ selected_extensions }}"},
+        {"ignore_files": "{{ ignored }}"},
+    ],
+)
+def test_dynamic_directory_filters_preserve_executable_sources(tmp_path, options):
+    ctx = _variable_collection(
+        tmp_path,
+        [
+            {
+                "hosts": "localhost",
+                "roles": ["agent"],
+                "tasks": [{"include_vars": {"dir": ".", **options}}],
+            }
+        ],
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"agent"}
+
+
+@pytest.mark.parametrize("data_first", [False, True])
+def test_task_shaped_variable_sequence_is_classified_before_traversal(
+    tmp_path, data_first
+):
+    data_name = "a_data.yml" if data_first else "z_data.yml"
+    play_name = "z_play.yml" if data_first else "a_play.yml"
+    ctx = _variable_collection(
+        tmp_path,
+        [],
+        {
+            f"scenario/{data_name}": yaml.safe_dump([{"include_vars": play_name}]),
+            f"scenario/{play_name}": yaml.safe_dump(
+                [
+                    {
+                        "hosts": "localhost",
+                        "roles": ["agent"],
+                        "vars_files": [data_name],
+                    }
+                ]
+            ),
+        },
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {"agent"}
+
+
+def test_existing_external_search_candidate_blocks_local_fallback(tmp_path):
+    collection = tmp_path / "collection"
+    ctx = _variable_collection(
+        collection,
+        [],
+        {
+            "roles/wrapper/tasks/main.yml": "- include_vars: ../../../roles/agent/defaults/main.yml\n",
+        },
+    )
+    _write_files(tmp_path, {"roles/agent/defaults/main.yml": "outside: true\n"})
+    ctx.root = collection / "roles/wrapper"
+    assert list(RoleCrawler().crawl(ctx)) == []
+
+
+def test_executable_walker_ignores_module_payloads_and_keeps_block_tasks(tmp_path):
+    ctx = _variable_collection(
+        tmp_path,
+        [
+            {
+                "hosts": "localhost",
+                "tasks": [
+                    {"debug": {"msg": {"include_role": "bogus"}}},
+                    {
+                        "block": [{"include_role": "agent"}],
+                        "rescue": [{"include_role": "rescue_role"}],
+                        "always": [{"include_role": "always_role"}],
+                    },
+                ],
+            }
+        ],
+    )
+    assert {f.name for f in RoleCrawler().crawl(ctx)} == {
+        "agent",
+        "rescue_role",
+        "always_role",
+    }
